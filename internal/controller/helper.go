@@ -18,6 +18,7 @@ package controller
 
 import (
 	"encoding/json"
+	"maps"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -104,17 +105,7 @@ func taintsEqual(a, b []corev1.Taint) bool {
 	return true
 }
 
-// labelsEqual checks if two label maps are equal.
+// labelsEqual checks if two label maps hold the same keys with the same values.
 func labelsEqual(a, b map[string]string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-
-	for k, v := range a {
-		if b[k] != v {
-			return false
-		}
-	}
-
-	return true
+	return maps.Equal(a, b)
 }
