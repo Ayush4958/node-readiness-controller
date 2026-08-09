@@ -159,6 +159,18 @@ func (r *RuleReadinessController) processNodeAgainstAllRules(ctx context.Context
 			r.recordNodeFailure(rule, node.Name, "EvaluationError", err.Error())
 			errs = append(errs, err)
 			metrics.Failures.WithLabelValues(rule.Name, string(metrics.FailureReasonEvaluationError)).Inc()
+		} else {
+			// Clear any stale failures from previous reconciliation attempts.
+			// Without this, transient errors permanently leak into Status.FailedNodes
+			// because the cached rule object still carries the old failure entry,
+			// which gets re merged into the API server on every subsequent patch.
+			var updatedFailedNodes []readinessv1alpha1.NodeFailure
+			for _, failure := range rule.Status.FailedNodes {
+				if failure.NodeName != node.Name {
+					updatedFailedNodes = append(updatedFailedNodes, failure)
+				}
+			}
+			rule.Status.FailedNodes = updatedFailedNodes
 		}
 
 		// Persist the rule status

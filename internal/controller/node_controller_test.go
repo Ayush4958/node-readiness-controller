@@ -1154,5 +1154,71 @@ var _ = Describe("Node Controller", func() {
 			Expect(after).To(BeNumerically(">", before),
 				"metrics.Failures{rule, EvaluationError} must increment when the node reconciler hits an evaluation error")
 		})
+
+		It("should clear FailedNodes entry when node evaluation succeeds after a prior transient failure", func() {
+			// Setup: node satisfies the rule condition (TestCondition=True),
+			// but has a stale FailedNodes entry from a previous transient error.
+			node := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{Name: "recovery-node"},
+				Status: corev1.NodeStatus{
+					Conditions: []corev1.NodeCondition{
+						{Type: "TestCondition", Status: corev1.ConditionTrue},
+					},
+				},
+			}
+			rule := &nodereadinessiov1alpha1.NodeReadinessRule{
+				ObjectMeta: metav1.ObjectMeta{Name: "recovery-rule"},
+				Spec: nodereadinessiov1alpha1.NodeReadinessRuleSpec{
+					NodeSelector: metav1.LabelSelector{},
+					Conditions: []nodereadinessiov1alpha1.ConditionRequirement{
+						{Type: "TestCondition", RequiredStatus: corev1.ConditionTrue},
+					},
+					Taint: corev1.Taint{
+						Key:    "readiness.k8s.io/recovery-test",
+						Effect: corev1.TaintEffectNoSchedule,
+					},
+					EnforcementMode: nodereadinessiov1alpha1.EnforcementModeContinuous,
+				},
+				Status: nodereadinessiov1alpha1.NodeReadinessRuleStatus{
+					FailedNodes: []nodereadinessiov1alpha1.NodeFailure{
+						{
+							NodeName: "recovery-node",
+							Reason:   "EvaluationError",
+							Message:  "simulated transient error from prior reconcile",
+						},
+					},
+				},
+			}
+
+			fc := fakeclient.NewClientBuilder().
+				WithScheme(testScheme).
+				WithObjects(node, rule).
+				WithStatusSubresource(rule).
+				Build()
+
+			controller := &RuleReadinessController{
+				Client:        fc,
+				Scheme:        testScheme,
+				clientset:     fake.NewSimpleClientset(),
+				ruleCache:     map[string]*nodereadinessiov1alpha1.NodeReadinessRule{rule.Name: rule},
+				EventRecorder: events.NewFakeRecorder(10),
+			}
+
+			// Pre-condition: the stale failure must exist
+			Expect(rule.Status.FailedNodes).To(HaveLen(1))
+
+			err := controller.processNodeAgainstAllRules(ctx, node)
+			Expect(err).ToNot(HaveOccurred())
+
+			// Post-condition: the stale failure must be cleared from the in-memory rule
+			Expect(rule.Status.FailedNodes).To(BeEmpty(),
+				"FailedNodes must be cleared after successful evaluation")
+
+			// Also verify via the API server that the patched status has no stale failures
+			latestRule := &nodereadinessiov1alpha1.NodeReadinessRule{}
+			Expect(fc.Get(ctx, client.ObjectKey{Name: rule.Name}, latestRule)).To(Succeed())
+			Expect(latestRule.Status.FailedNodes).To(BeEmpty(),
+				"FailedNodes must be cleared in the persisted rule status")
+		})
 	})
 })
