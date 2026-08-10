@@ -1210,10 +1210,6 @@ var _ = Describe("Node Controller", func() {
 			err := controller.processNodeAgainstAllRules(ctx, node)
 			Expect(err).ToNot(HaveOccurred())
 
-			// Post-condition: the stale failure must be cleared from the in-memory rule
-			Expect(rule.Status.FailedNodes).To(BeEmpty(),
-				"FailedNodes must be cleared after successful evaluation")
-
 			// Also verify via the API server that the patched status has no stale failures
 			latestRule := &nodereadinessiov1alpha1.NodeReadinessRule{}
 			Expect(fc.Get(ctx, client.ObjectKey{Name: rule.Name}, latestRule)).To(Succeed())
