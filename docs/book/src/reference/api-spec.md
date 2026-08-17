@@ -30,7 +30,25 @@ _Appears in:_
 | `type` _string_ | type corresponds to the Node condition type being evaluated. |  | MaxLength: 316 <br />MinLength: 1 <br /> |
 | `currentStatus` _[ConditionStatus](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.35/#conditionstatus-v1-core)_ | currentStatus is the actual status value observed on the Node, one of True, False, Unknown. |  | Enum: [True False Unknown] <br /> |
 | `requiredStatus` _[ConditionStatus](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.35/#conditionstatus-v1-core)_ | requiredStatus is the status value defined in the rule that must be matched, one of True, False, Unknown. |  | Enum: [True False Unknown] <br /> |
-| `defaultStatus` _[ConditionStatus](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.35/#conditionstatus-v1-core)_ | defaultStatus is the fallback status value configured in the rule spec, which is used for evaluation if the condition is not present on the Node. |  | Enum: [True False Unknown] <br /> |
+| `defaultStatus` _[ConditionStatus](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.35/#conditionstatus-v1-core)_ | defaultStatus is the status a condition is evaluated to if the condition<br />is not found in a node. Reflects the defaultStatus configured in the rule<br />spec. |  | Enum: [True False Unknown] <br /> |
+
+
+#### ConditionPolicy
+
+_Underlying type:_ _string_
+
+ConditionPolicy defines how the list of conditions is aggregated when evaluating a rule.
+
+_Validation:_
+- Enum: [allOf anyOf]
+
+_Appears in:_
+- [NodeReadinessRuleSpec](#nodereadinessrulespec)
+
+| Field | Description |
+| --- | --- |
+| `allOf` | ConditionPolicyAllOf requires ALL conditions to match their requiredStatus (default).<br /> |
+| `anyOf` | ConditionPolicyAnyOf requires at least ONE condition to match its requiredStatus.<br /> |
 
 
 #### ConditionRequirement
@@ -38,7 +56,8 @@ _Appears in:_
 
 
 ConditionRequirement defines a specific Node condition and the status value
-required to trigger the controller's action.
+required to trigger the controller's action. It also contains an optional
+default status value.
 
 
 
@@ -49,7 +68,7 @@ _Appears in:_
 | --- | --- | --- | --- |
 | `type` _string_ | type of Node condition<br />Following kubebuilder validation is referred from https://pkg.go.dev/k8s.io/apimachinery/pkg/apis/meta/v1#Condition |  | MaxLength: 316 <br />MinLength: 1 <br /> |
 | `requiredStatus` _[ConditionStatus](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.35/#conditionstatus-v1-core)_ | requiredStatus is status of the condition, one of True, False, Unknown. |  | Enum: [True False Unknown] <br /> |
-| `defaultStatus` _[ConditionStatus](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.35/#conditionstatus-v1-core)_ | defaultStatus is the fallback status assumed when the condition is completely missing from the Node's status. <br /><br />Note: This field must not be set when enforcementMode is bootstrap-only. | Unknown | Enum: [True False Unknown] <br /> |
+| `defaultStatus` _[ConditionStatus](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.35/#conditionstatus-v1-core)_ | defaultStatus is the status a condition is evaluated to if the condition<br />is not found in a node.<br />Accepted values are True, False, Unknown. It is optional.<br />When omitted, the effective default is Unknown, applied transparently by<br />the controller at evaluation time.<br />Note: This field must not be set when enforcementMode is bootstrap-only. |  | Enum: [True False Unknown] <br /> |
 
 
 #### DryRunResults
@@ -163,8 +182,9 @@ _Appears in:_
 | --- | --- | --- | --- |
 | `conditions` _[ConditionRequirement](#conditionrequirement) array_ | conditions contains a list of the Node conditions that defines the specific<br />criteria that must be met for taints to be managed on the target Node.<br />The presence or status of these conditions directly triggers the application or removal of Node taints. |  | MaxItems: 32 <br />MinItems: 1 <br /> |
 | `enforcementMode` _[EnforcementMode](#enforcementmode)_ | enforcementMode specifies how the controller maintains the desired state.<br />enforcementMode is one of bootstrap-only, continuous.<br />"bootstrap-only" applies the configuration once during initial setup.<br />"continuous" ensures the state is monitored and corrected throughout the resource lifecycle. |  | Enum: [bootstrap-only continuous] <br /> |
-| `taint` _[Taint](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.35/#taint-v1-core)_ | taint defines the specific Taint (Key, Value, and Effect) to be managed<br />on Nodes that meet the defined condition criteria. |  |  |
+| `taint` _[Taint](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.35/#taint-v1-core)_ | taint defines the specific Taint (Key, Value, and Effect) to be managed<br />on Nodes that meet the defined condition criteria.<br />The taint key must follow Kubernetes qualified name format: prefix/name<br />where prefix is 'readiness.k8s.io' (DNS subdomain) and name is a qualified<br />name (max 63 chars, alphanumeric, '-', '_', '.', must start and end with alphanumeric).<br />ref: git.k8s.io/kubernetes/staging/src/k8s.io/apimachinery/pkg/api/validate/content/kube.go#L24-L72<br />Supported effects: NoSchedule, PreferNoSchedule, NoExecute.<br />Caution: NoExecute evicts existing pods and can cause significant disruption<br />when combined with continuous enforcement mode. Prefer NoSchedule for most use cases. |  |  |
 | `nodeSelector` _[LabelSelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.35/#labelselector-v1-meta)_ | nodeSelector limits the scope of this rule to a specific subset of Nodes. |  |  |
+| `conditionPolicy` _[ConditionPolicy](#conditionpolicy)_ | conditionPolicy controls how the conditions list is evaluated.<br />"allOf" (default) requires every condition to match its requiredStatus before the taint is removed.<br />"anyOf" requires at least one condition to match its requiredStatus.<br />anyOf cannot be used with enforcementMode: bootstrap-only. |  | Enum: [allOf anyOf] <br /> |
 | `dryRun` _boolean_ | dryRun when set to true, The controller will evaluate Node conditions and log intended taint modifications<br />without persisting changes to the cluster. Proposed actions are reflected in the resource status. |  |  |
 
 
