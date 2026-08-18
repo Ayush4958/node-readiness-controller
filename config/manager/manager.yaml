@@ -79,7 +79,9 @@ spec:
         image: controller:latest
         imagePullPolicy: IfNotPresent
         name: manager
-        ports: []
+        ports:
+        - containerPort: 8081
+          name: http
         securityContext:
           readOnlyRootFilesystem: true
           allowPrivilegeEscalation: false
