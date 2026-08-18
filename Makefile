@@ -248,11 +248,11 @@ endif
 
 .PHONY: docker-build-reporter
 docker-build-reporter: ## Build reporter container image with Docker.
-	DOCKER_BUILDKIT=1 docker build -f Dockerfile.reporter -t ${IMG_PREFIX}:${IMG_TAG} .
+	DOCKER_BUILDKIT=1 docker build --build-arg VERSION=$(VERSION) --build-arg GIT_COMMIT=$(GIT_COMMIT) -f Dockerfile.reporter -t ${IMG_PREFIX}:${IMG_TAG} .
 
 .PHONY: podman-build-reporter
 podman-build-reporter: ## Build reporter container image with Podman.
-	podman build -f Dockerfile.reporter -t ${IMG_PREFIX}:${IMG_TAG} .
+	podman build --build-arg VERSION=$(VERSION) --build-arg GIT_COMMIT=$(GIT_COMMIT) -f Dockerfile.reporter -t ${IMG_PREFIX}:${IMG_TAG} .
 
 .PHONY: docker-push-reporter
 docker-push-reporter: ## Push docker image with the reporter.
