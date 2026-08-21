@@ -172,7 +172,7 @@ topologySpreadConstraints: []
 #   whenUnsatisfiable: DoNotSchedule
 #   labelSelector:
 #     matchLabels:
-#       app.kubernetes.io/name: node-readiness-controller
+#       app.kubernetes.io/name: node-readiness-controller # Note: Adjust this if you use nameOverride/fullnameOverride
 
 # NOTE: When using validating webhooks, apply NodeReadinessRule resources after the controller webhook is ready, for example in a separate helm upgrade.
 nodeReadinessRules: []
