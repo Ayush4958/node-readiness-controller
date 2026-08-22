@@ -27,6 +27,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 
@@ -332,14 +333,26 @@ func TestUpdateNodeCondition(t *testing.T) {
 	conditionType := "TestCondition"
 	staleTime := time.Now().Add(-6 * time.Minute)
 
+	countUpdateCalls := func(client *fake.Clientset) int {
+		calls := 0
+		for _, a := range client.Actions() {
+			if a.GetVerb() == "update" && a.GetSubresource() == "status" && a.GetResource().Resource == "nodes" {
+				calls++
+			}
+		}
+		return calls
+	}
+
 	tests := []struct {
-		name             string
-		existingNode     *corev1.Node
-		health           *HealthResponse
-		heartbeatPeriod  time.Duration
-		wantStatus       corev1.ConditionStatus
-		wantReason       string
-		wantUpdateCalled bool
+		name                        string
+		existingNode                *corev1.Node
+		health                      *HealthResponse
+		heartbeatPeriod             time.Duration
+		wantStatus                  corev1.ConditionStatus
+		wantReason                  string
+		wantUpdateCount             int
+		wantTransitionTimePreserved bool
+		wantNotFoundErr             bool
 	}{
 		{
 			name: "New Condition Healthy",
@@ -351,13 +364,16 @@ func TestUpdateNodeCondition(t *testing.T) {
 				Reason:  "EndpointOK",
 				Message: "All good",
 			},
-			heartbeatPeriod:  5 * time.Minute,
-			wantStatus:       corev1.ConditionTrue,
-			wantReason:       "EndpointOK",
-			wantUpdateCalled: true,
+			heartbeatPeriod:             5 * time.Minute,
+			wantStatus:                  corev1.ConditionTrue,
+			wantReason:                  "EndpointOK",
+			wantUpdateCount:             1,
+			wantTransitionTimePreserved: false,
 		},
 		{
-			name: "State change triggers immediate write",
+			// A state change bypasses the heartbeat gate, so the update is written
+			// immediately rather than waiting for the next heartbeat.
+			name: "update condition on state change",
 			existingNode: &corev1.Node{
 				ObjectMeta: metav1.ObjectMeta{Name: nodeName},
 				Status: corev1.NodeStatus{
@@ -374,10 +390,11 @@ func TestUpdateNodeCondition(t *testing.T) {
 				Reason:  "HealthCheckFailed",
 				Message: "Something failed",
 			},
-			heartbeatPeriod:  5 * time.Minute,
-			wantStatus:       corev1.ConditionFalse,
-			wantReason:       "HealthCheckFailed",
-			wantUpdateCalled: true,
+			heartbeatPeriod:             5 * time.Minute,
+			wantStatus:                  corev1.ConditionFalse,
+			wantReason:                  "HealthCheckFailed",
+			wantUpdateCount:             1,
+			wantTransitionTimePreserved: false,
 		},
 		{
 			name: "State unchanged: Fresh heartbeat (skip write)",
@@ -401,10 +418,11 @@ func TestUpdateNodeCondition(t *testing.T) {
 				Reason:  "EndpointOk",
 				Message: "All good",
 			},
-			heartbeatPeriod:  5 * time.Minute,
-			wantStatus:       corev1.ConditionTrue,
-			wantReason:       "EndpointOk",
-			wantUpdateCalled: false,
+			heartbeatPeriod:             5 * time.Minute,
+			wantStatus:                  corev1.ConditionTrue,
+			wantReason:                  "EndpointOk",
+			wantUpdateCount:             0,
+			wantTransitionTimePreserved: true,
 		},
 		{
 			name: "State unchanged: Stale heartbeat (force write)",
@@ -428,38 +446,68 @@ func TestUpdateNodeCondition(t *testing.T) {
 				Reason:  "EndpointOk",
 				Message: "All good",
 			},
-			heartbeatPeriod:  5 * time.Minute,
-			wantStatus:       corev1.ConditionTrue,
-			wantReason:       "EndpointOk",
-			wantUpdateCalled: true,
+			heartbeatPeriod:             5 * time.Minute,
+			wantStatus:                  corev1.ConditionTrue,
+			wantReason:                  "EndpointOk",
+			wantUpdateCount:             1,
+			wantTransitionTimePreserved: true,
+		},
+		{
+			name:         "Node not found",
+			existingNode: nil,
+			health: &HealthResponse{
+				Healthy: true,
+				Reason:  "EndpointOK",
+				Message: "All good",
+			},
+			heartbeatPeriod: 5 * time.Minute,
+			wantUpdateCount: 0,
+			wantNotFoundErr: true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			client := fake.NewSimpleClientset(tt.existingNode)
+			var client *fake.Clientset
+			if tt.existingNode != nil {
+				client = fake.NewClientset(tt.existingNode)
+			} else {
+				client = fake.NewClientset()
+			}
 
-			countUpdates := func() int {
-				n := 0
-				for _, a := range client.Actions() {
-					if a.GetVerb() == "update" && a.GetSubresource() == "status" && a.GetResource().Resource == "nodes" {
-						n++
+			var previousTransition metav1.Time
+			if tt.existingNode != nil {
+				for _, cond := range tt.existingNode.Status.Conditions {
+					if string(cond.Type) == conditionType {
+						previousTransition = cond.LastTransitionTime
+						break
 					}
 				}
-				return n
+			}
+			if previousTransition.IsZero() {
+				previousTransition = metav1.NewTime(staleTime)
 			}
 
 			err := updateNodeCondition(context.Background(), client, nodeName, conditionType, tt.health, tt.heartbeatPeriod)
 			if err != nil {
-				t.Errorf("updateNodeCondition() error = %v", err)
+				if tt.wantNotFoundErr {
+					if !apierrors.IsNotFound(err) {
+						t.Fatalf("updateNodeCondition() error = %v, want a NotFound error", err)
+					}
+					if got := countUpdateCalls(client); got != tt.wantUpdateCount {
+						t.Errorf("UpdateStatus called = %v, want %v", got, tt.wantUpdateCount)
+					}
+					return
+				}
+				t.Fatalf("updateNodeCondition() error = %v", err)
+			}
+			if tt.wantNotFoundErr {
+				t.Fatal("updateNodeCondition() succeeded, want a NotFound error")
 			}
 
-			// Assert API call frequency
-			updateCount := countUpdates()
-			if tt.wantUpdateCalled && updateCount == 0 {
-				t.Errorf("Expected UpdateStatus to be called, but it was skipped")
-			} else if !tt.wantUpdateCalled && updateCount > 0 {
-				t.Errorf("Expected UpdateStatus to be skipped, but it was called %d times", updateCount)
+			// Assert whether the status write reached the API server
+			if got := countUpdateCalls(client); got != tt.wantUpdateCount {
+				t.Errorf("UpdateStatus called = %v, want %v", got, tt.wantUpdateCount)
 			}
 
 			updatedNode, err := client.CoreV1().Nodes().Get(context.Background(), nodeName, metav1.GetOptions{})
@@ -484,6 +532,14 @@ func TestUpdateNodeCondition(t *testing.T) {
 			}
 			if foundCondition.Reason != tt.wantReason {
 				t.Errorf("Condition reason = %v, want %v", foundCondition.Reason, tt.wantReason)
+			}
+
+			if tt.wantTransitionTimePreserved {
+				if !foundCondition.LastTransitionTime.Equal(&previousTransition) {
+					t.Errorf("LastTransitionTime = %v, want it preserved as %v", foundCondition.LastTransitionTime, previousTransition)
+				}
+			} else if !foundCondition.LastTransitionTime.After(previousTransition.Time) {
+				t.Errorf("LastTransitionTime = %v, want a new transition at or after %v", foundCondition.LastTransitionTime, previousTransition.Time)
 			}
 		})
 	}
