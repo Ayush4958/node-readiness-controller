@@ -23,8 +23,15 @@ tests:
       - hasDocuments:
           count: 0
 
-  # Note: testing .Capabilities.APIVersions.Has is not fully supported by helm-unittest,
-  # but assuming the environment supports it, we can test standard rendering.
+  - it: does not render when monitoring.coreos.com/v1 capability is missing
+    set:
+      metrics:
+        enabled: true
+        serviceMonitor:
+          enabled: true
+    asserts:
+      - hasDocuments:
+          count: 0
 
   - it: renders correctly when both flags are true (assumes monitoring.coreos.com/v1 exists)
     capabilities:
@@ -51,7 +58,7 @@ tests:
           path: spec.endpoints[0].scrapeTimeout
           value: 10s
 
-  - it: uses https scheme and injects tlsConfig when metrics.secure is true
+  - it: uses https scheme, bearer token, and injects custom tlsConfig when secure is true
     capabilities:
       apiVersions:
         - monitoring.coreos.com/v1
@@ -61,6 +68,9 @@ tests:
         secure: true
         serviceMonitor:
           enabled: true
+          bearerTokenFile: /custom/path/to/token
+          tlsConfig:
+            insecureSkipVerify: true
     asserts:
       - equal:
           path: spec.endpoints[0].port
@@ -68,6 +78,9 @@ tests:
       - equal:
           path: spec.endpoints[0].scheme
           value: https
+      - equal:
+          path: spec.endpoints[0].bearerTokenFile
+          value: /custom/path/to/token
       - equal:
           path: spec.endpoints[0].tlsConfig.insecureSkipVerify
           value: true

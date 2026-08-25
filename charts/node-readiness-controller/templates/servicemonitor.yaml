@@ -23,8 +23,15 @@ spec:
       scrapeTimeout: {{ .Values.metrics.serviceMonitor.scrapeTimeout }}
       {{- if .Values.metrics.secure }}
       scheme: https
+      {{- if .Values.metrics.serviceMonitor.bearerTokenFile }}
+      bearerTokenFile: {{ .Values.metrics.serviceMonitor.bearerTokenFile }}
+      {{- else }}
+      bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+      {{- end }}
+      {{- with .Values.metrics.serviceMonitor.tlsConfig }}
       tlsConfig:
-        insecureSkipVerify: true
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- end }}
       {{- with .Values.metrics.serviceMonitor.metricRelabelings }}
       metricRelabelings:
