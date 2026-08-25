@@ -124,6 +124,21 @@ metrics:
     targetPort: 8443
   certDir: /tmp/k8s-metrics-server/metrics-certs
   certSecretName: metrics-server-cert
+  # -- Prometheus Operator ServiceMonitor.
+  # Requires metrics.enabled=true and the Prometheus Operator CRD
+  # (monitoring.coreos.com/v1) to be installed in the cluster.
+  serviceMonitor:
+    enabled: false
+    # -- Additional labels for the ServiceMonitor (e.g. release: prometheus)
+    labels: {}
+    # -- Scrape interval
+    interval: 30s
+    # -- Scrape timeout
+    scrapeTimeout: 10s
+    # -- Metric relabeling configs
+    metricRelabelings: []
+    # -- Relabeling configs
+    relabelings: []
 
 # Webhook server configuration
 webhook:
