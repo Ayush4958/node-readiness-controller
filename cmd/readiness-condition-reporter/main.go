@@ -36,6 +36,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/klog/v2"
+	ctrl "sigs.k8s.io/controller-runtime"
 )
 
 const (
@@ -122,12 +123,7 @@ func main() {
 	}
 
 	// Create Kubernetes client
-	config, err := rest.InClusterConfig()
-	if err != nil {
-		klog.ErrorS(err, "Failed to create in-cluster config")
-		klog.Flush()
-		os.Exit(1)
-	}
+	config := ctrl.GetConfigOrDie()
 
 	// Set the constrained impersonation config
 	if os.Getenv(envImpersonateNode) == "true" {
