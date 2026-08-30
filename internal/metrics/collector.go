@@ -21,11 +21,24 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	corev1 "k8s.io/api/core/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
+
+	readinessv1alpha1 "sigs.k8s.io/node-readiness-controller/api/v1alpha1"
 )
 
 // collectTimeout limits how long a scrape can wait for cached data.
 const collectTimeout = 5 * time.Second
+
+// NodeLister lists Nodes for the collector.
+type NodeLister interface {
+	ListNodes(ctx context.Context) ([]corev1.Node, error)
+}
+
+// RuleLister lists NodeReadinessRules for the collector.
+type RuleLister interface {
+	ListRules(ctx context.Context) ([]*readinessv1alpha1.NodeReadinessRule, error)
+}
 
 // RuleNodeCounts holds the number of held and released nodes for a rule.
 type RuleNodeCounts struct {
@@ -35,7 +48,23 @@ type RuleNodeCounts struct {
 
 // RuleNodeStateLister lists held and released nodes for each rule.
 type RuleNodeStateLister interface {
-	ListRuleNodeStates(ctx context.Context) (map[string]RuleNodeCounts, error)
+	ListRuleNodeStates(ctx context.Context, nodes []corev1.Node, rules []*readinessv1alpha1.NodeReadinessRule) (map[string]RuleNodeCounts, error)
+}
+
+// RuleBlockedConditions holds blocked node counts by condition.
+type RuleBlockedConditions map[string]float64
+
+// BlockedNodesLister lists blocked node counts for each rule and condition.
+type BlockedNodesLister interface {
+	ListBlockedNodes(ctx context.Context, nodes []corev1.Node, rules []*readinessv1alpha1.NodeReadinessRule) (map[string]RuleBlockedConditions, error)
+}
+
+// ReadinessLister aggregates the scrape-time lookups the collector needs.
+type ReadinessLister interface {
+	NodeLister
+	RuleLister
+	RuleNodeStateLister
+	BlockedNodesLister
 }
 
 var ruleNodesDesc = prometheus.NewDesc(
@@ -45,18 +74,26 @@ var ruleNodesDesc = prometheus.NewDesc(
 	nil,
 )
 
+var blockedNodesDesc = prometheus.NewDesc(
+	"node_readiness_blocked_nodes",
+	"Number of nodes blocked by each required condition.",
+	[]string{"rule", "condition"},
+	nil,
+)
+
 // ReadinessCollector is a prometheus.Collector that reads at scrape time.
 type ReadinessCollector struct {
-	lister RuleNodeStateLister
+	lister ReadinessLister
 }
 
-func NewReadinessCollector(lister RuleNodeStateLister) *ReadinessCollector {
+func NewReadinessCollector(lister ReadinessLister) *ReadinessCollector {
 	return &ReadinessCollector{lister: lister}
 }
 
 // Describe implements prometheus.Collector.
 func (c *ReadinessCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- ruleNodesDesc
+	ch <- blockedNodesDesc
 }
 
 // Collect implements prometheus.Collector.
@@ -64,14 +101,36 @@ func (c *ReadinessCollector) Collect(ch chan<- prometheus.Metric) {
 	ctx, cancel := context.WithTimeout(context.Background(), collectTimeout)
 	defer cancel()
 
-	counts, err := c.lister.ListRuleNodeStates(ctx)
+	nodes, err := c.lister.ListNodes(ctx)
 	if err != nil {
-		ctrl.Log.V(2).Info("Failed to list rule node states", "error", err)
+		ctrl.Log.V(2).Info("Failed to list nodes", "error", err)
 		return
 	}
 
-	for rule, rc := range counts {
-		ch <- prometheus.MustNewConstMetric(ruleNodesDesc, prometheus.GaugeValue, rc.Held, rule, string(RuleNodeStateHeld))
-		ch <- prometheus.MustNewConstMetric(ruleNodesDesc, prometheus.GaugeValue, rc.Released, rule, string(RuleNodeStateReleased))
+	rules, err := c.lister.ListRules(ctx)
+	if err != nil {
+		ctrl.Log.V(2).Info("Failed to list rules", "error", err)
+		return
+	}
+
+	nodeStatesByRule, err := c.lister.ListRuleNodeStates(ctx, nodes, rules)
+	if err != nil {
+		ctrl.Log.V(2).Info("Failed to list rule node states", "error", err)
+	} else {
+		for rule, rc := range nodeStatesByRule {
+			ch <- prometheus.MustNewConstMetric(ruleNodesDesc, prometheus.GaugeValue, rc.Held, rule, string(RuleNodeStateHeld))
+			ch <- prometheus.MustNewConstMetric(ruleNodesDesc, prometheus.GaugeValue, rc.Released, rule, string(RuleNodeStateReleased))
+		}
+	}
+
+	blocked, err := c.lister.ListBlockedNodes(ctx, nodes, rules)
+	if err != nil {
+		ctrl.Log.V(2).Info("Failed to list blocked nodes", "error", err)
+	} else {
+		for rule, conditions := range blocked {
+			for condition, count := range conditions {
+				ch <- prometheus.MustNewConstMetric(blockedNodesDesc, prometheus.GaugeValue, count, rule, condition)
+			}
+		}
 	}
 }

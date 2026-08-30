@@ -531,57 +531,139 @@ func (r *RuleReadinessController) getApplicableRulesForNode(ctx context.Context,
 	return applicableRules
 }
 
-// ListRuleNodeStates returns the number of held and released nodes for each rule.
-func (r *RuleReadinessController) ListRuleNodeStates(ctx context.Context) (map[string]metrics.RuleNodeCounts, error) {
-	ruleList := &readinessv1alpha1.NodeReadinessRuleList{}
-	if err := r.List(ctx, ruleList); err != nil {
-		return nil, err
-	}
-
+// ListNodes returns the current list of Nodes.
+func (r *RuleReadinessController) ListNodes(ctx context.Context) ([]corev1.Node, error) {
 	nodeList := &corev1.NodeList{}
 	if err := r.List(ctx, nodeList); err != nil {
 		return nil, err
 	}
+	return nodeList.Items, nil
+}
 
+// ListRules returns the current list of NodeReadinessRules.
+func (r *RuleReadinessController) ListRules(ctx context.Context) ([]*readinessv1alpha1.NodeReadinessRule, error) {
+	ruleList := &readinessv1alpha1.NodeReadinessRuleList{}
+	if err := r.List(ctx, ruleList); err != nil {
+		return nil, err
+	}
+	rules := make([]*readinessv1alpha1.NodeReadinessRule, len(ruleList.Items))
+	for i := range ruleList.Items {
+		rules[i] = &ruleList.Items[i]
+	}
+	return rules, nil
+}
+
+// forEachRuleNode applies callbacks to nodes matching each rule.
+//
+//nolint:unparam // keep error return for future extensibility and API stability.
+func (r *RuleReadinessController) forEachRuleNode(
+	ctx context.Context,
+	nodes []corev1.Node,
+	rules []*readinessv1alpha1.NodeReadinessRule,
+	skipRule func(rule *readinessv1alpha1.NodeReadinessRule) bool,
+	onRule func(rule *readinessv1alpha1.NodeReadinessRule),
+	onNode func(rule *readinessv1alpha1.NodeReadinessRule, node *corev1.Node, held bool),
+) error {
 	log := ctrl.LoggerFrom(ctx)
 
-	counts := make(map[string]metrics.RuleNodeCounts, len(ruleList.Items))
-	for i := range ruleList.Items {
-		rule := &ruleList.Items[i]
+	for _, rule := range rules {
 		if rule.Spec.DryRun {
+			continue
+		}
+		if skipRule(rule) {
 			continue
 		}
 
 		// Parse the selector once per rule.
-		selector, err := metav1.LabelSelectorAsSelector(&rule.Spec.NodeSelector)
+		selector, err := parseNodeSelector(rule)
 		if err != nil {
 			log.V(2).Info("Invalid node selector for rule", "rule", rule.Name, "error", err)
 			continue
 		}
 
-		rc := metrics.RuleNodeCounts{}
-		for i := range nodeList.Items {
-			node := &nodeList.Items[i]
+		onRule(rule)
+
+		for i := range nodes {
+			node := &nodes[i]
 			if !selector.Matches(labels.Set(node.Labels)) {
 				continue
 			}
-			if r.hasTaintBySpec(node, rule.Spec.Taint) {
+			onNode(rule, node, r.hasTaintBySpec(node, rule.Spec.Taint))
+		}
+	}
+
+	return nil
+}
+
+// ListRuleNodeStates returns the number of held and released nodes for each rule.
+func (r *RuleReadinessController) ListRuleNodeStates(ctx context.Context, nodes []corev1.Node, rules []*readinessv1alpha1.NodeReadinessRule) (map[string]metrics.RuleNodeCounts, error) {
+	counts := make(map[string]metrics.RuleNodeCounts)
+
+	err := r.forEachRuleNode(ctx, nodes, rules,
+		func(rule *readinessv1alpha1.NodeReadinessRule) bool { return false },
+		func(rule *readinessv1alpha1.NodeReadinessRule) {
+			counts[rule.Name] = metrics.RuleNodeCounts{}
+		},
+		func(rule *readinessv1alpha1.NodeReadinessRule, node *corev1.Node, held bool) {
+			rc := counts[rule.Name]
+			if held {
 				rc.Held++
 			} else {
 				rc.Released++
 			}
-		}
-		counts[rule.Name] = rc
+			counts[rule.Name] = rc
+		},
+	)
+	if err != nil {
+		return nil, err
 	}
 
 	return counts, nil
+}
+
+// ListBlockedNodes returns the number of blocked nodes for each rule and unsatisfied condition.
+func (r *RuleReadinessController) ListBlockedNodes(ctx context.Context, nodes []corev1.Node, rules []*readinessv1alpha1.NodeReadinessRule) (map[string]metrics.RuleBlockedConditions, error) {
+	result := make(map[string]metrics.RuleBlockedConditions)
+
+	err := r.forEachRuleNode(ctx, nodes, rules,
+		func(rule *readinessv1alpha1.NodeReadinessRule) bool { return false },
+		func(rule *readinessv1alpha1.NodeReadinessRule) {
+			counts := make(metrics.RuleBlockedConditions, len(rule.Spec.Conditions))
+			for _, cond := range rule.Spec.Conditions {
+				counts[cond.Type] = 0
+			}
+			result[rule.Name] = counts
+		},
+		func(rule *readinessv1alpha1.NodeReadinessRule, node *corev1.Node, held bool) {
+			if !held {
+				return
+			}
+			counts := result[rule.Name]
+			for _, cond := range rule.Spec.Conditions {
+				effectiveStatus, _ := r.getConditionStatus(node, cond.Type, cond.GetDefaultStatus())
+				if effectiveStatus != cond.RequiredStatus {
+					counts[cond.Type]++
+				}
+			}
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return result, nil
+}
+
+// parseNodeSelector parses a rule's NodeSelector into a labels.Selector.
+func parseNodeSelector(rule *readinessv1alpha1.NodeReadinessRule) (labels.Selector, error) {
+	return metav1.LabelSelectorAsSelector(&rule.Spec.NodeSelector)
 }
 
 // ruleAppliesTo checks if a rule applies to a node.
 func (r *RuleReadinessController) ruleAppliesTo(ctx context.Context, rule *readinessv1alpha1.NodeReadinessRule, node *corev1.Node) bool {
 	log := ctrl.LoggerFrom(ctx)
 
-	selector, err := metav1.LabelSelectorAsSelector(&rule.Spec.NodeSelector)
+	selector, err := parseNodeSelector(rule)
 	if err != nil {
 		log.Error(err, "Invalid node selector for rule", "rule", rule.Name)
 		return false
@@ -736,9 +818,15 @@ func (r *RuleReadinessController) processDryRun(ctx context.Context, rule *readi
 func (r *RuleReadinessController) cleanupTaintsForRule(ctx context.Context, rule *readinessv1alpha1.NodeReadinessRule, nodeList *corev1.NodeList) error {
 	log := ctrl.LoggerFrom(ctx)
 
+	selector, err := parseNodeSelector(rule)
+	if err != nil {
+		log.Error(err, "Invalid node selector for rule during cleanup", "rule", rule.Name)
+		return nil
+	}
+
 	var errors []string
 	for _, node := range nodeList.Items {
-		if !r.ruleAppliesTo(ctx, rule, &node) {
+		if !selector.Matches(labels.Set(node.Labels)) {
 			continue
 		}
 
