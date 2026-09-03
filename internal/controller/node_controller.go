@@ -152,12 +152,13 @@ func (r *RuleReadinessController) processNodeAgainstAllRules(ctx context.Context
 			"rule", rule.Name,
 			"ruleResourceVersion", rule.ResourceVersion)
 
-		if err := r.evaluateRuleForNode(ctx, rule, node); err != nil {
-			log.Error(err, "Failed to evaluate rule for node",
+		evalErr := r.evaluateRuleForNode(ctx, rule, node)
+		if evalErr != nil {
+			log.Error(evalErr, "Failed to evaluate rule for node",
 				"node", node.Name, "rule", rule.Name)
 			// Continue with other rules even if one fails
-			r.recordNodeFailure(rule, node.Name, "EvaluationError", err.Error())
-			errs = append(errs, err)
+			r.recordNodeFailure(rule, node.Name, "EvaluationError", evalErr.Error())
+			errs = append(errs, evalErr)
 			metrics.Failures.WithLabelValues(rule.Name, string(metrics.FailureReasonEvaluationError)).Inc()
 		} else {
 			// Clear any stale failures from previous reconciliation attempts.
@@ -172,58 +173,44 @@ func (r *RuleReadinessController) processNodeAgainstAllRules(ctx context.Context
 
 		var successfullyPatchedRule *readinessv1alpha1.NodeReadinessRule
 
-		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-			latestRule := &readinessv1alpha1.NodeReadinessRule{}
-			if err := r.Get(ctx, client.ObjectKey{Name: rule.Name}, latestRule); err != nil {
-				return err
-			}
+		delta := nodeStatusDelta{
+			evaluations: make(map[string]readinessv1alpha1.NodeEvaluation),
+			failures:    make(map[string]*readinessv1alpha1.NodeFailure),
+		}
 
-			patch := client.MergeFrom(latestRule.DeepCopy())
-
-			// update only this specific node evaluation status
-			currEval := readinessv1alpha1.NodeEvaluation{}
-			for _, eval := range rule.Status.NodeEvaluations {
-				if eval.NodeName == node.Name {
-					currEval = eval
+		if evalErr != nil {
+			// On evaluation failure, record the failure in delta and do not populate delta.evaluations
+			// so any stale evaluation isn't persisted.
+			for _, failure := range rule.Status.FailedNodes {
+				if failure.NodeName == node.Name {
+					failureCopy := failure
+					delta.failures[node.Name] = &failureCopy
 					break
 				}
 			}
+		} else {
+			// On evaluation success, clear any previously-recorded failure for this node and record the fresh evaluation.
+			delta.failures[node.Name] = nil
 
-			found := false
-			for i := range latestRule.Status.NodeEvaluations {
-				if latestRule.Status.NodeEvaluations[i].NodeName == node.Name {
-					latestRule.Status.NodeEvaluations[i] = currEval
-					found = true
-					break
-				}
-			}
-			if !found {
-				latestRule.Status.NodeEvaluations = append(
-					latestRule.Status.NodeEvaluations,
-					currEval,
-				)
-			}
-
-			// handle status.FailedNodes for this node
 			var updatedFailedNodes []readinessv1alpha1.NodeFailure
-			for _, failure := range latestRule.Status.FailedNodes {
+			for _, failure := range rule.Status.FailedNodes {
 				if failure.NodeName != node.Name {
 					updatedFailedNodes = append(updatedFailedNodes, failure)
 				}
 			}
-			for _, failure := range rule.Status.FailedNodes {
-				if failure.NodeName == node.Name {
-					updatedFailedNodes = append(updatedFailedNodes, failure)
+			rule.Status.FailedNodes = updatedFailedNodes
+
+			for _, eval := range rule.Status.NodeEvaluations {
+				if eval.NodeName == node.Name {
+					delta.evaluations[node.Name] = eval
+					break
 				}
 			}
-			latestRule.Status.FailedNodes = updatedFailedNodes
+		}
 
-			if err := r.Status().Patch(ctx, latestRule, patch); err != nil {
-				return err
-			}
-
+		err := r.patchRuleStatusWithOptimisticLock(ctx, rule.Name, func(latestRule *readinessv1alpha1.NodeReadinessRule) {
+			applyNodeStatusDelta(latestRule, delta)
 			successfullyPatchedRule = latestRule
-			return nil
 		})
 
 		if err != nil {
@@ -449,7 +436,8 @@ func (r *RuleReadinessController) markBootstrapCompleted(ctx context.Context, no
 	deferred := false
 	annotationKey := bootstrapAnnotationKey(rule.GetUID())
 
-	// retry to handle conflict with concurrent node updates
+	// The optimistic lock here protects from a race-condition adding a taint between hasTaintBySpec
+	// check and mark completed annotation patch from concurrent reconciliations.
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		node := &corev1.Node{}
 		if err := r.Get(ctx, client.ObjectKey{Name: nodeName}, node); err != nil {
@@ -467,7 +455,7 @@ func (r *RuleReadinessController) markBootstrapCompleted(ctx context.Context, no
 		}
 		deferred = false
 
-		patch := client.MergeFromWithOptions(node.DeepCopy(), client.MergeFromWithOptimisticLock{})
+		stored := node.DeepCopy()
 
 		// Initialize annotations map if nil.
 		if node.Annotations == nil {
@@ -475,7 +463,7 @@ func (r *RuleReadinessController) markBootstrapCompleted(ctx context.Context, no
 		}
 
 		node.Annotations[annotationKey] = bootstrapAnnotationValue(rule.Name)
-		if err := r.Patch(ctx, node, patch); err != nil {
+		if err := r.Patch(ctx, node, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{})); err != nil {
 			return err
 		}
 

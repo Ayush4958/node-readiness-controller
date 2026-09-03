@@ -168,3 +168,138 @@ func TestGetApplicableRulesForNode_DeepCopy(t *testing.T) {
 
 	g.Expect(cachedRule.Status.AppliedNodes).To(Equal([]string{"node-1"}))
 }
+
+func TestApplyNodeStatusDelta(t *testing.T) {
+	g := NewWithT(t)
+
+	t.Run("empty delta leaves status untouched", func(t *testing.T) {
+		rule := &readinessv1alpha1.NodeReadinessRule{
+			Status: readinessv1alpha1.NodeReadinessRuleStatus{
+				NodeEvaluations: []readinessv1alpha1.NodeEvaluation{
+					{NodeName: "node-1"},
+				},
+				FailedNodes: []readinessv1alpha1.NodeFailure{
+					{NodeName: "node-1", Reason: "Err"},
+				},
+			},
+		}
+
+		delta := nodeStatusDelta{
+			evaluations: nil,
+			failures:    nil,
+		}
+
+		applyNodeStatusDelta(rule, delta)
+		g.Expect(rule.Status.NodeEvaluations).To(HaveLen(1))
+		g.Expect(rule.Status.NodeEvaluations[0].NodeName).To(Equal("node-1"))
+		g.Expect(rule.Status.FailedNodes).To(HaveLen(1))
+		g.Expect(rule.Status.FailedNodes[0].NodeName).To(Equal("node-1"))
+	})
+
+	t.Run("merges evaluation updates and new evaluations in sorted order", func(t *testing.T) {
+		rule := &readinessv1alpha1.NodeReadinessRule{
+			Status: readinessv1alpha1.NodeReadinessRuleStatus{
+				NodeEvaluations: []readinessv1alpha1.NodeEvaluation{
+					{NodeName: "node-1", TaintStatus: readinessv1alpha1.TaintStatusAbsent},
+					{NodeName: "node-3", TaintStatus: readinessv1alpha1.TaintStatusAbsent},
+				},
+			},
+		}
+
+		delta := nodeStatusDelta{
+			evaluations: map[string]readinessv1alpha1.NodeEvaluation{
+				"node-1": {NodeName: "node-1", TaintStatus: readinessv1alpha1.TaintStatusPresent}, // update existing
+				"node-2": {NodeName: "node-2", TaintStatus: readinessv1alpha1.TaintStatusPresent}, // add new
+			},
+		}
+
+		applyNodeStatusDelta(rule, delta)
+
+		g.Expect(rule.Status.NodeEvaluations).To(HaveLen(3))
+		g.Expect(rule.Status.NodeEvaluations[0].NodeName).To(Equal("node-1"))
+		g.Expect(rule.Status.NodeEvaluations[0].TaintStatus).To(Equal(readinessv1alpha1.TaintStatusPresent))
+		g.Expect(rule.Status.NodeEvaluations[1].NodeName).To(Equal("node-2"))
+		g.Expect(rule.Status.NodeEvaluations[2].NodeName).To(Equal("node-3"))
+		g.Expect(rule.Status.NodeEvaluations[2].TaintStatus).To(Equal(readinessv1alpha1.TaintStatusAbsent))
+	})
+
+	t.Run("merges failures and clears failure when nil in delta", func(t *testing.T) {
+		rule := &readinessv1alpha1.NodeReadinessRule{
+			Status: readinessv1alpha1.NodeReadinessRuleStatus{
+				FailedNodes: []readinessv1alpha1.NodeFailure{
+					{NodeName: "node-1", Reason: "OldError"},
+					{NodeName: "node-3", Reason: "PersistentError"},
+				},
+			},
+		}
+
+		delta := nodeStatusDelta{
+			failures: map[string]*readinessv1alpha1.NodeFailure{
+				"node-1": nil,                                      // clear failure for node-1
+				"node-2": {NodeName: "node-2", Reason: "NewError"}, // add failure for node-2
+			},
+		}
+
+		applyNodeStatusDelta(rule, delta)
+
+		g.Expect(rule.Status.FailedNodes).To(HaveLen(2))
+		g.Expect(rule.Status.FailedNodes[0].NodeName).To(Equal("node-2"))
+		g.Expect(rule.Status.FailedNodes[0].Reason).To(Equal("NewError"))
+		g.Expect(rule.Status.FailedNodes[1].NodeName).To(Equal("node-3"))
+		g.Expect(rule.Status.FailedNodes[1].Reason).To(Equal("PersistentError"))
+	})
+
+	t.Run("does not add zero-value evaluation when evaluations map has no entry for node", func(t *testing.T) {
+		rule := &readinessv1alpha1.NodeReadinessRule{
+			Status: readinessv1alpha1.NodeReadinessRuleStatus{
+				NodeEvaluations: []readinessv1alpha1.NodeEvaluation{
+					{NodeName: "other-node", TaintStatus: readinessv1alpha1.TaintStatusPresent},
+				},
+			},
+		}
+
+		delta := nodeStatusDelta{
+			evaluations: make(map[string]readinessv1alpha1.NodeEvaluation),
+			failures: map[string]*readinessv1alpha1.NodeFailure{
+				"probe-node": {NodeName: "probe-node", Reason: "EvaluationError"},
+			},
+		}
+
+		applyNodeStatusDelta(rule, delta)
+
+		g.Expect(rule.Status.NodeEvaluations).To(HaveLen(1))
+		g.Expect(rule.Status.NodeEvaluations[0].NodeName).To(Equal("other-node"))
+		g.Expect(rule.Status.FailedNodes).To(HaveLen(1))
+		g.Expect(rule.Status.FailedNodes[0].NodeName).To(Equal("probe-node"))
+	})
+
+	t.Run("clears stale failure when evaluation succeeds and produces new evaluation", func(t *testing.T) {
+		rule := &readinessv1alpha1.NodeReadinessRule{
+			Status: readinessv1alpha1.NodeReadinessRuleStatus{
+				NodeEvaluations: []readinessv1alpha1.NodeEvaluation{
+					{NodeName: "other-node", TaintStatus: readinessv1alpha1.TaintStatusPresent},
+				},
+				FailedNodes: []readinessv1alpha1.NodeFailure{
+					{NodeName: "node-1", Reason: "EvaluationError", Message: "old failure"},
+				},
+			},
+		}
+
+		delta := nodeStatusDelta{
+			evaluations: map[string]readinessv1alpha1.NodeEvaluation{
+				"node-1": {NodeName: "node-1", TaintStatus: readinessv1alpha1.TaintStatusAbsent},
+			},
+			failures: map[string]*readinessv1alpha1.NodeFailure{
+				"node-1": nil, // clear failure for node-1 on success
+			},
+		}
+
+		applyNodeStatusDelta(rule, delta)
+
+		g.Expect(rule.Status.NodeEvaluations).To(HaveLen(2))
+		g.Expect(rule.Status.NodeEvaluations[0].NodeName).To(Equal("node-1"))
+		g.Expect(rule.Status.NodeEvaluations[0].TaintStatus).To(Equal(readinessv1alpha1.TaintStatusAbsent))
+		g.Expect(rule.Status.NodeEvaluations[1].NodeName).To(Equal("other-node"))
+		g.Expect(rule.Status.FailedNodes).To(BeEmpty())
+	})
+}
